@@ -13,6 +13,10 @@
 #include <linux/vfio.h>
 #include <uapi/linux/vfio.h>
 
+#define FOOBAR
+#include <../drivers/vfio/vfio_iommu_type1.c>
+#undef FOOBAR
+
 #include "vfio.h"
 
 struct vfio_container {
@@ -68,7 +72,7 @@ static const struct vfio_iommu_driver_ops vfio_noiommu_ops = {
 	.owner = THIS_MODULE,
 	.open = vfio_noiommu_open,
 	.release = vfio_noiommu_release,
-	.ioctl = vfio_noiommu_ioctl,
+	.ioctl = vfio_iommu_type1_ioctl,
 	.attach_group = vfio_noiommu_attach_group,
 	.detach_group = vfio_noiommu_detach_group,
 };

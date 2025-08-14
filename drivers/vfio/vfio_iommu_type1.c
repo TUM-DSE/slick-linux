@@ -37,6 +37,7 @@
 #include <linux/vfio.h>
 #include <linux/workqueue.h>
 #include <linux/notifier.h>
+#include <linux/set_memory.h>
 #include "vfio.h"
 
 #define DRIVER_VERSION  "0.2"
@@ -1578,98 +1579,138 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 	if ((prot && set_vaddr) || (!prot && !set_vaddr))
 		return -EINVAL;
 
+	// TODO we completely repurpose VFIO for decrypting pages in AMD SEV-SNP, because we don't need VFIO with IOMMU anyways.
+	// current->mm can be used to resolve user addresses (vfio_iommu_type1.c:641)
+	unsigned int npages = PAGE_ALIGN(size) >> PAGE_SHIFT;
+	unsigned long limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+
+	unsigned long pfn_base = 0;
+	struct vfio_batch batch;
+
 	mutex_lock(&iommu->lock);
+	vfio_batch_init(&batch);
 
-	pgsize = (size_t)1 << __ffs(iommu->pgsize_bitmap);
-
-	WARN_ON((pgsize - 1) & PAGE_MASK);
-
-	if (!size || (size | iova | vaddr) & (pgsize - 1)) {
-		ret = -EINVAL;
+	/* Pin a contiguous chunk of memory */
+	unsigned int npage = vfio_pin_pages_remote(dma, vaddr + dma->size,
+					    size >> PAGE_SHIFT, &pfn_base, limit,
+					    &batch);
+	if (npage <= 0) {
+		WARN_ON(!npage);
+		ret = (int)npage;
 		goto out_unlock;
 	}
 
-	/* Don't allow IOVA or virtual address wrap */
-	if (iova + size - 1 < iova || vaddr + size - 1 < vaddr) {
-		ret = -EINVAL;
-		goto out_unlock;
-	}
+	// TODO for each batch->page
+		void* kaddr = kmap(batch.pages[0]);
 
-	dma = vfio_find_dma(iommu, iova, size);
-	if (set_vaddr) {
-		if (!dma) {
-			ret = -ENOENT;
-		} else if (!dma->vaddr_invalid || dma->iova != iova ||
-			   dma->size != size) {
-			ret = -EINVAL;
-		} else {
-			ret = vfio_change_dma_owner(dma);
-			if (ret)
-				goto out_unlock;
-			dma->vaddr = vaddr;
-			dma->vaddr_invalid = false;
-			iommu->vaddr_invalid_count--;
+		ret = set_memory_decrypted(kaddr, 1); // num pages 1
+		if (ret) {
+			pr_warn("failed to decrypt page %p, ret=%d\n",
+							kaddr, ret);
+			ret = -1;
+			goto out_unlock;
 		}
-		goto out_unlock;
-	} else if (dma) {
-		ret = -EEXIST;
-		goto out_unlock;
-	}
+			pr_warn("decrypt page %p at userspace %p, ret=%d\n",
+							kaddr, vaddr, ret);
 
-	if (!iommu->dma_avail) {
-		ret = -ENOSPC;
-		goto out_unlock;
-	}
+	// TODO kunmap
 
-	if (!vfio_iommu_iova_dma_valid(iommu, iova, iova + size - 1)) {
-		ret = -EINVAL;
-		goto out_unlock;
-	}
 
-	dma = kzalloc(sizeof(*dma), GFP_KERNEL);
-	if (!dma) {
-		ret = -ENOMEM;
-		goto out_unlock;
-	}
+	// TODO esure that pages are unpinned again (put_page?)
 
-	iommu->dma_avail--;
-	dma->iova = iova;
-	dma->vaddr = vaddr;
-	dma->prot = prot;
 
-	/*
-	 * We need to be able to both add to a task's locked memory and test
-	 * against the locked memory limit and we need to be able to do both
-	 * outside of this call path as pinning can be asynchronous via the
-	 * external interfaces for mdev devices.  RLIMIT_MEMLOCK requires a
-	 * task_struct. Save the group_leader so that all DMA tracking uses
-	 * the same task, to make debugging easier.  VM locked pages requires
-	 * an mm_struct, so grab the mm in case the task dies.
-	 */
-	get_task_struct(current->group_leader);
-	dma->task = current->group_leader;
-	dma->lock_cap = capable(CAP_IPC_LOCK);
-	dma->mm = current->mm;
-	mmgrab(dma->mm);
+	// pgsize = (size_t)1 << __ffs(iommu->pgsize_bitmap);
 
-	dma->pfn_list = RB_ROOT;
+	// WARN_ON((pgsize - 1) & PAGE_MASK);
 
-	/* Insert zero-sized and grow as we map chunks of it */
-	vfio_link_dma(iommu, dma);
+	// if (!size || (size | iova | vaddr) & (pgsize - 1)) {
+	// 	ret = -EINVAL;
+	// 	goto out_unlock;
+	// }
 
-	/* Don't pin and map if container doesn't contain IOMMU capable domain*/
-	if (list_empty(&iommu->domain_list))
-		dma->size = size;
-	else
-		ret = vfio_pin_map_dma(iommu, dma, size);
+	// /* Don't allow IOVA or virtual address wrap */
+	// if (iova + size - 1 < iova || vaddr + size - 1 < vaddr) {
+	// 	ret = -EINVAL;
+	// 	goto out_unlock;
+	// }
 
-	if (!ret && iommu->dirty_page_tracking) {
-		ret = vfio_dma_bitmap_alloc(dma, pgsize);
-		if (ret)
-			vfio_remove_dma(iommu, dma);
-	}
+	// dma = vfio_find_dma(iommu, iova, size);
+	// if (set_vaddr) {
+	// 	if (!dma) {
+	// 		ret = -ENOENT;
+	// 	} else if (!dma->vaddr_invalid || dma->iova != iova ||
+	// 		   dma->size != size) {
+	// 		ret = -EINVAL;
+	// 	} else {
+	// 		ret = vfio_change_dma_owner(dma);
+	// 		if (ret)
+	// 			goto out_unlock;
+	// 		dma->vaddr = vaddr;
+	// 		dma->vaddr_invalid = false;
+	// 		iommu->vaddr_invalid_count--;
+	// 	}
+	// 	goto out_unlock;
+	// } else if (dma) {
+	// 	ret = -EEXIST;
+	// 	goto out_unlock;
+	// }
+
+	// if (!iommu->dma_avail) {
+	// 	ret = -ENOSPC;
+	// 	goto out_unlock;
+	// }
+
+	// if (!vfio_iommu_iova_dma_valid(iommu, iova, iova + size - 1)) {
+	// 	ret = -EINVAL;
+	// 	goto out_unlock;
+	// }
+
+	// dma = kzalloc(sizeof(*dma), GFP_KERNEL);
+	// if (!dma) {
+	// 	ret = -ENOMEM;
+	// 	goto out_unlock;
+	// }
+
+	// iommu->dma_avail--;
+	// dma->iova = iova;
+	// dma->vaddr = vaddr;
+	// dma->prot = prot;
+
+	// /*
+	//  * We need to be able to both add to a task's locked memory and test
+	//  * against the locked memory limit and we need to be able to do both
+	//  * outside of this call path as pinning can be asynchronous via the
+	//  * external interfaces for mdev devices.  RLIMIT_MEMLOCK requires a
+	//  * task_struct. Save the group_leader so that all DMA tracking uses
+	//  * the same task, to make debugging easier.  VM locked pages requires
+	//  * an mm_struct, so grab the mm in case the task dies.
+	//  */
+	// get_task_struct(current->group_leader);
+	// dma->task = current->group_leader;
+	// dma->lock_cap = capable(CAP_IPC_LOCK);
+	// dma->mm = current->mm;
+	// mmgrab(dma->mm);
+
+	// dma->pfn_list = RB_ROOT;
+
+	// /* Insert zero-sized and grow as we map chunks of it */
+	// vfio_link_dma(iommu, dma);
+
+	// /* Don't pin and map if container doesn't contain IOMMU capable domain*/
+	// if (list_empty(&iommu->domain_list))
+	// 	dma->size = size;
+	// else
+	// 	ret = vfio_pin_map_dma(iommu, dma, size);
+
+	// if (!ret && iommu->dirty_page_tracking) {
+	// 	ret = vfio_dma_bitmap_alloc(dma, pgsize);
+	// 	if (ret)
+	// 		vfio_remove_dma(iommu, dma);
+	// }
 
 out_unlock:
+	vfio_batch_fini(&batch);
+
 	mutex_unlock(&iommu->lock);
 	return ret;
 }
@@ -3198,6 +3239,7 @@ static void __exit vfio_iommu_type1_cleanup(void)
 	vfio_unregister_iommu_driver(&vfio_iommu_driver_ops_type1);
 }
 
+#ifndef FOOBAR
 module_init(vfio_iommu_type1_init);
 module_exit(vfio_iommu_type1_cleanup);
 
@@ -3205,3 +3247,4 @@ MODULE_VERSION(DRIVER_VERSION);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
+#endif
