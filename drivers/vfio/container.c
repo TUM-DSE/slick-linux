@@ -18,6 +18,10 @@
 #include <linux/dma-map-ops.h>
 #include <linux/cma.h>
 #include <linux/dma-direct.h>
+/* #include <uapi/asm/mman.h> */
+#include <uapi/linux/mman.h>
+#include <asm/tlbflush.h>
+#include <linux/kallsyms.h>
 
 #include "vfio.h"
 
@@ -526,7 +530,99 @@ static bool cma_in_zone(gfp_t gfp)
 		return end <= DMA_BIT_MASK(32);
 	return true;
 }
-static int hacky_atomic_pool_expand(size_t pool_size)
+
+#include <linux/kprobes.h>
+
+static unsigned long (*kallsyms_lookup_name_ptr)(const char *name) = NULL;
+
+static int find_kallsyms_lookup_name(void)
+{
+    struct kprobe kp = {
+        .symbol_name = "kallsyms_lookup_name"
+    };
+
+  	if (kallsyms_lookup_name_ptr != NULL)
+  		return 0;
+
+    if (register_kprobe(&kp) < 0) {
+        printk(KERN_ERR "Failed to register kprobe\n");
+        return -1;
+    }
+
+    kallsyms_lookup_name_ptr = (unsigned long (*)(const char *))kp.addr;
+    unregister_kprobe(&kp);
+
+    return 0;
+}
+
+static struct mm_struct *get_init_mm(void)
+{
+    static struct mm_struct *init_mm_ptr = NULL;
+
+    if (!init_mm_ptr && kallsyms_lookup_name_ptr) {
+        init_mm_ptr = (struct mm_struct *)kallsyms_lookup_name_ptr("init_mm");
+    }
+
+    return init_mm_ptr;
+}
+
+static void debug_kernel_pte(unsigned long addr)
+{
+    pte_t *pte;
+    spinlock_t *ptl;
+    int ret;
+
+    static struct mm_struct *init_mm_ptr = NULL;
+
+    if (!init_mm_ptr) {
+        /* init_mm_ptr = (struct mm_struct *)kallsyms_lookup_name("init_mm"); */
+				find_kallsyms_lookup_name();
+    		init_mm_ptr = get_init_mm();
+        if (!init_mm_ptr) {
+            printk(KERN_ERR "Could not find init_mm symbol\n");
+            return;
+        }
+    }
+
+    ret = follow_pte(init_mm_ptr, addr, &pte, &ptl);
+    if (ret) {
+        pr_err("follow_pte failed: %d\n", ret);
+        return;
+    }
+
+    if (pte_none(*pte)) {
+        pr_err("PTE is empty at %lx\n", addr);
+    } else {
+        pr_info("PTE exists: %lx, present=%d, pfn=%lx\n",
+                pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
+    }
+
+    pte_unmap_unlock(pte, ptl);
+}
+
+static void debug_user_pte(unsigned long addr)
+{
+    pte_t *pte;
+    spinlock_t *ptl;
+    int ret;
+
+    ret = follow_pte(current->mm, addr, &pte, &ptl);
+    if (ret) {
+        pr_err("follow_pte failed: %d\n", ret);
+        return;
+    }
+
+    if (pte_none(*pte)) {
+        pr_err("PTE is empty at %lx\n", addr);
+    } else {
+        pr_info("PTE exists: %lx, present=%d, pfn=%lx\n",
+                pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
+    }
+
+    pte_unmap_unlock(pte, ptl);
+}
+
+static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 {
 	pr_err("fizz1\n");
 	gfp_t gfp;
@@ -542,6 +638,7 @@ static int hacky_atomic_pool_expand(size_t pool_size)
 
 	/* Cannot allocate larger than MAX_ORDER */
 	order = min(get_order(pool_size), MAX_ORDER);
+	pr_err("pool_size %ld, order %d\n", pool_size, order);
 
 	do {
 		pool_size = 1 << (PAGE_SHIFT + order);
@@ -565,6 +662,7 @@ static int hacky_atomic_pool_expand(size_t pool_size)
 #else
 	addr = page_to_virt(page);
 #endif
+	debug_kernel_pte(addr);
 	/*
 	 * Memory in the atomic DMA pools must be unencrypted, the pools do not
 	 * shrink so no re-encryption occurs in dma_direct_free().
@@ -577,11 +675,76 @@ static int hacky_atomic_pool_expand(size_t pool_size)
 	/* 			pool_size, NUMA_NO_NODE); */
 	/* if (ret) */
 	/* 	goto encrypt_mapping; */
+	debug_kernel_pte(addr);
 
 	/* dma_atomic_pool_size_add(gfp, pool_size); */
-	pr_err("fizz heureka1 virt %p phys %ld, %ld\n", addr, page_to_pfn(page), (page_to_pfn(page))*PAGE_SIZE);
+	pr_err("fizz heureka1 virt %p phys %lx, %lx\n", addr, page_to_pfn(page), (page_to_pfn(page))*PAGE_SIZE);
 	*((uint32_t*)addr) = 0x1337;
-	pr_err("u32: %d\n", *((uint32_t*)addr));
+	pr_err("u32: %lx\n", *((uint32_t*)addr));
+
+	// map page to user
+	/* down_read(&current->mm->mmap_sem); */
+	/* mmap_write_lock(current->mm); */
+
+
+	/* Obtain the address to map to. we verify (or select) it and ensure
+	 * that it represents a valid section of the address space.
+	 */
+	// unsigned long populate = 0;
+	// user_addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
+  // pr_err("user addr: %lx\n", user_addr);
+	// if (IS_ERR_VALUE(addr))
+	// 	return -2;
+	// user_addr = do_mmap(NULL, user_addr, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, 0, &populate, NULL);
+	// pr_err("do_mmap %lx\n", user_addr);
+
+	// test some pte bits
+	/* pgprot_t foo = pgprot_encrypted(__pgprot(0)); */
+	/* pr_err("prot enc %lx\n", foo.pgprot); */
+
+	// Find the VMA containing this address
+  struct vm_area_struct *vma = find_vma(current->mm, user_addr);
+  pr_err("vma found: %p\n", vma);
+	debug_user_pte(user_addr);
+  asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
+	debug_user_pte(user_addr);
+ 	pgprot_t prot = vm_get_page_prot(vma->vm_flags);
+ 	prot = __pgprot(pgprot_val(prot) | _PAGE_RW);
+ 	prot = __pgprot(pgprot_val(prot) & ~(1ULL << 51)); // unset c-flag (->decrypt)
+ 	// TODO same for vm_flags?
+ 	pr_err("pgprot=%lx\n", prot.pgprot);
+  //if (!vma || user_addr < vma->vm_start || user_addr >= vma->vm_end) {
+  //		pr_err("vma failed\n");
+  //    /* up_read(&current->mm->mmap_sem); */
+  //		mmap_write_unlock(current->mm);
+  //    __free_page(page);
+  //    return -EFAULT;
+  //}
+  // Insert the page into the VMA
+	mmap_write_lock(vma->vm_mm);
+  /* ret = vm_insert_page(vma, user_addr, page); */
+  pr_err("%lx >= %lx && %lx < %lx", addr, PAGE_OFFSET, addr, high_memory);
+  /* vm_flags_set(vma, VM_MIXEDMAP); */
+  vm_flags_set(vma, VM_PFNMAP | VM_SHARED | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP | VM_READ | VM_WRITE );
+	zap_vma_ptes(vma, user_addr, PAGE_SIZE);
+  pr_err("is cow %d, flags %x\n", is_cow_mapping(vma->vm_flags), vma->vm_flags);
+  ret = vmf_insert_pfn_prot(vma, user_addr, page_to_pfn(page), prot);
+	mmap_write_unlock(vma->vm_mm);
+  /* vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot); */
+  /* ret = remap_pfn_range(vma, user_addr, page_to_pfn(page), PAGE_SIZE, vma->vm_page_prot); */
+  if (ret != VM_FAULT_NOPAGE) {
+  	pr_err("failed %d: page not mapped to user at 0x%lx\n", ret, user_addr);
+  	goto remove_mapping;
+  }
+  pr_err("page mapped to user at %lx\n", user_addr);
+  /* up_read(&current->mm->mmap_sem); */
+  /* mmap_write_unlock(current->mm); */
+
+	debug_user_pte(user_addr);
+  vma = find_vma(current->mm, user_addr);
+  asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
+	debug_user_pte(user_addr);
+
 	return 0;
 
 encrypt_mapping:
@@ -618,7 +781,7 @@ static int vfio_cvm_map_dma(struct vfio_iommu *iommu,
 
 	if (map.argsz < minsz || map.flags & ~mask)
 		return -EINVAL;
-	return hacky_atomic_pool_expand(map.size);
+	return hacky_atomic_pool_expand(map.vaddr, map.size);
 	/* return vfio_cvm_dma_do_map(iommu, &map); */
 }
 
