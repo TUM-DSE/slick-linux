@@ -626,6 +626,7 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 {
 	pr_err("fizz1\n");
 	gfp_t gfp;
+	size_t nr_pages = 1; // TODO
 	if (IS_ENABLED(CONFIG_ZONE_DMA))
 		gfp = GFP_KERNEL | GFP_DMA;
 	else
@@ -633,35 +634,55 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 
 	unsigned int order;
 	struct page *page = NULL;
+	struct page **pages = NULL;
 	void *addr;
 	int ret = -ENOMEM;
 
-	/* Cannot allocate larger than MAX_ORDER */
-	order = min(get_order(pool_size), MAX_ORDER);
-	pr_err("pool_size %ld, order %d\n", pool_size, order);
+	pages = kmalloc(nr_pages*sizeof(void*), GFP_KERNEL);
+	if (pages == NULL)
+		return -ENOMEM;
 
-	do {
-		pool_size = 1 << (PAGE_SHIFT + order);
-		if (cma_in_zone(gfp))
-			page = dma_alloc_from_contiguous(NULL, 1 << order,
-							 order, false);
-		if (!page)
-			page = alloc_pages(gfp, order);
-	} while (!page && order-- > 0);
-	if (!page)
-		goto out;
+	pr_err("pages %lx\n", pages);
+	ret = pin_user_pages_fast(
+		user_addr,
+		nr_pages,
+		0 // maybe FOLL_LONGTERM if we want to explicitly want to pin beyond the parent function invcation lifetime
+		,
+		pages
+	);
+	if (ret != nr_pages) {
+		pr_err("pin_user_pages: failed %d\n", ret);
+		goto free_pages;
+	}
+	page = pages[0]; // TODO
 
-	arch_dma_prep_coherent(page, pool_size);
+//	/* Cannot allocate larger than MAX_ORDER */
+//	order = min(get_order(pool_size), MAX_ORDER);
+//	pr_err("pool_size %ld, order %d\n", pool_size, order);
+//
+//	do {
+//		pool_size = 1 << (PAGE_SHIFT + order);
+//		if (cma_in_zone(gfp))
+//			page = dma_alloc_from_contiguous(NULL, 1 << order,
+//							 order, false);
+//		if (!page)
+//			page = alloc_pages(gfp, order);
+//	} while (!page && order-- > 0);
+//	if (!page)
+//		goto out;
+//
+//	arch_dma_prep_coherent(page, pool_size);
 
-#ifdef CONFIG_DMA_DIRECT_REMAP
-	addr = dma_common_contiguous_remap(page, pool_size,
-					   pgprot_dmacoherent(PAGE_KERNEL),
-					   __builtin_return_address(0));
-	if (!addr)
-		goto free_page;
-#else
+//#ifdef CONFIG_DMA_DIRECT_REMAP
+//	addr = dma_common_contiguous_remap(page, pool_size,
+//					   pgprot_dmacoherent(PAGE_KERNEL),
+//					   __builtin_return_address(0));
+//	if (!addr)
+//		goto free_page;
+//#else
+//	addr = page_to_virt(page);
+//#endif
 	addr = page_to_virt(page);
-#endif
 	debug_kernel_pte(addr);
 	/*
 	 * Memory in the atomic DMA pools must be unencrypted, the pools do not
@@ -758,8 +779,12 @@ remove_mapping:
 //#ifdef CONFIG_DMA_DIRECT_REMAP
 //	dma_common_free_remap(addr, pool_size);
 //#endif
-free_page: __maybe_unused
-	__free_pages(page, order);
+free_page:
+	/* __free_pages(page, order); */
+unpin_out:
+	unpin_user_pages(pages, nr_pages);
+free_pages:
+	kfree(pages);
 out:
 	return ret;
 }
