@@ -22,6 +22,7 @@
 #include <uapi/linux/mman.h>
 #include <asm/tlbflush.h>
 #include <linux/kallsyms.h>
+#include <asm/memtype.h>
 
 #include "vfio.h"
 
@@ -622,8 +623,27 @@ static void debug_user_pte(unsigned long addr)
     pte_unmap_unlock(pte, ptl);
 }
 
+static void __cpa_flush_all(void *arg)
+{
+	unsigned long cache = (unsigned long)arg;
+
+	/*
+	 * Flush all to work around Errata in early athlons regarding
+	 * large page flushing.
+	 */
+	__flush_tlb_all();
+
+	if (cache && boot_cpu_data.x86 >= 4)
+		wbinvd();
+}
+
 static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 {
+	if (pool_size != PAGE_SIZE) {
+		pr_err("VFIO CVM hack: We dont support decrypting vairable sized memory regions yet. Please do one page at a time.\n");
+		pr_err"VFIO CVM hack:   :o)\n");
+		return -EINVAL;
+	}
 	pr_err("fizz1\n");
 	gfp_t gfp;
 	size_t nr_pages = 1; // TODO
@@ -708,6 +728,7 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	/* mmap_write_lock(current->mm); */
 
 
+
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
 	 */
@@ -723,48 +744,90 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	/* pgprot_t foo = pgprot_encrypted(__pgprot(0)); */
 	/* pr_err("prot enc %lx\n", foo.pgprot); */
 
-	// Find the VMA containing this address
-  struct vm_area_struct *vma = find_vma(current->mm, user_addr);
-  pr_err("vma found: %p\n", vma);
-	debug_user_pte(user_addr);
-  asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
-	debug_user_pte(user_addr);
- 	pgprot_t prot = vm_get_page_prot(vma->vm_flags);
- 	prot = __pgprot(pgprot_val(prot) | _PAGE_RW);
- 	prot = __pgprot(pgprot_val(prot) & ~(1ULL << 51)); // unset c-flag (->decrypt)
- 	// TODO same for vm_flags?
- 	pr_err("pgprot=%lx\n", prot.pgprot);
-  //if (!vma || user_addr < vma->vm_start || user_addr >= vma->vm_end) {
-  //		pr_err("vma failed\n");
-  //    /* up_read(&current->mm->mmap_sem); */
-  //		mmap_write_unlock(current->mm);
-  //    __free_page(page);
-  //    return -EFAULT;
-  //}
-  // Insert the page into the VMA
-	mmap_write_lock(vma->vm_mm);
-  /* ret = vm_insert_page(vma, user_addr, page); */
-  pr_err("%lx >= %lx && %lx < %lx", addr, PAGE_OFFSET, addr, high_memory);
-  /* vm_flags_set(vma, VM_MIXEDMAP); */
-  vm_flags_set(vma, VM_PFNMAP | VM_SHARED | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP | VM_READ | VM_WRITE );
-	zap_vma_ptes(vma, user_addr, PAGE_SIZE);
-  pr_err("is cow %d, flags %x\n", is_cow_mapping(vma->vm_flags), vma->vm_flags);
-  ret = vmf_insert_pfn_prot(vma, user_addr, page_to_pfn(page), prot);
-	mmap_write_unlock(vma->vm_mm);
-  /* vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot); */
-  /* ret = remap_pfn_range(vma, user_addr, page_to_pfn(page), PAGE_SIZE, vma->vm_page_prot); */
-  if (ret != VM_FAULT_NOPAGE) {
-  	pr_err("failed %d: page not mapped to user at 0x%lx\n", ret, user_addr);
-  	goto remove_mapping;
+
+	pr_info("flushing\n");
+	on_each_cpu(__cpa_flush_all, (void *) true, 1);
+	pr_info("flushed\n");
+  pte_t *pte;
+  spinlock_t *ptl;
+  ret = follow_pte(current->mm, user_addr, &pte, &ptl);
+  if (ret) {
+      pr_err("follow_pte failed: %d\n", ret);
+    	goto pte_unlock;
   }
-  pr_err("page mapped to user at %lx\n", user_addr);
-  /* up_read(&current->mm->mmap_sem); */
-  /* mmap_write_unlock(current->mm); */
+  if (pte_none(*pte)) {
+      pr_err("PTE is empty at %lx\n", user_addr);
+    goto pte_unlock;
+  }
+  pr_info("Found user PTE: %lx, present=%d, pfn=%lx\n",
+          pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
+pte_unlock:
+  pte_unmap_unlock(pte, ptl); // TODO
 
 	debug_user_pte(user_addr);
-  vma = find_vma(current->mm, user_addr);
+
+	pte_t old_pte = *pte;
+	pgprot_t new_prot = pte_pgprot(old_pte);
+	new_prot = pgprot_decrypted(new_prot);
+	pte_t new_pte = pfn_pte(pte_pfn(old_pte), new_prot);
+	pr_err("user pte %lx -> %lx\n", old_pte.pte, new_pte.pte);
+	asm volatile("" ::: "memory");
+	/* on_each_cpu(__cpa_flush_all, (void *) !!pgprot2cachemode(new_prot), 1); */
+	on_each_cpu(__cpa_flush_all, (void *) true, 1);
+	set_pte_atomic(pte, new_pte); // i doubt that our mess around here is atomic
+	on_each_cpu(__cpa_flush_all, (void *) true, 1);
+
+	// TODO Do hugepages have several PTEs per page? See __change_page_attr:repeat
+
+	// TODO We need some TLB flush at least no? see change_page_attr_set_clr() cpa_flush_all(!!pgprot2cachemode(new_prot));
   asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
+
 	debug_user_pte(user_addr);
+
+
+
+//	// Find the VMA containing this address
+//  struct vm_area_struct *vma = find_vma(current->mm, user_addr);
+//  pr_err("vma found: %p\n", vma);
+//	debug_user_pte(user_addr);
+//  asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
+//	debug_user_pte(user_addr);
+// 	pgprot_t prot = vm_get_page_prot(vma->vm_flags);
+// 	prot = __pgprot(pgprot_val(prot) | _PAGE_RW);
+// 	prot = __pgprot(pgprot_val(prot) & ~(1ULL << 51)); // unset c-flag (->decrypt)
+// 	// TODO same for vm_flags?
+// 	pr_err("pgprot=%lx\n", prot.pgprot);
+//  //if (!vma || user_addr < vma->vm_start || user_addr >= vma->vm_end) {
+//  //		pr_err("vma failed\n");
+//  //    /* up_read(&current->mm->mmap_sem); */
+//  //		mmap_write_unlock(current->mm);
+//  //    __free_page(page);
+//  //    return -EFAULT;
+//  //}
+//  // Insert the page into the VMA
+//	mmap_write_lock(vma->vm_mm);
+//  /* ret = vm_insert_page(vma, user_addr, page); */
+//  pr_err("%lx >= %lx && %lx < %lx", addr, PAGE_OFFSET, addr, high_memory);
+//  /* vm_flags_set(vma, VM_MIXEDMAP); */
+//  vm_flags_set(vma, VM_PFNMAP | VM_SHARED | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP | VM_READ | VM_WRITE );
+//	zap_vma_ptes(vma, user_addr, PAGE_SIZE);
+//  pr_err("is cow %d, flags %x\n", is_cow_mapping(vma->vm_flags), vma->vm_flags);
+//  ret = vmf_insert_pfn_prot(vma, user_addr, page_to_pfn(page), prot);
+//	mmap_write_unlock(vma->vm_mm);
+//  /* vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot); */
+//  /* ret = remap_pfn_range(vma, user_addr, page_to_pfn(page), PAGE_SIZE, vma->vm_page_prot); */
+//  if (ret != VM_FAULT_NOPAGE) {
+//  	pr_err("failed %d: page not mapped to user at 0x%lx\n", ret, user_addr);
+//  	goto remove_mapping;
+//  }
+//  pr_err("page mapped to user at %lx\n", user_addr);
+//  /* up_read(&current->mm->mmap_sem); */
+//  /* mmap_write_unlock(current->mm); */
+//
+//	debug_user_pte(user_addr);
+//  vma = find_vma(current->mm, user_addr);
+//  asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
+//	debug_user_pte(user_addr);
 
 	return 0;
 
