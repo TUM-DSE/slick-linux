@@ -720,8 +720,8 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 
 	/* dma_atomic_pool_size_add(gfp, pool_size); */
 	pr_err("fizz heureka1 virt %p phys %lx, %lx\n", addr, page_to_pfn(page), (page_to_pfn(page))*PAGE_SIZE);
-	*((uint32_t*)addr) = 0x1337;
-	pr_err("u32: %lx\n", *((uint32_t*)addr));
+	/* *((uint32_t*)addr) = 0x1337; */
+	/* pr_err("u32: %lx\n", *((uint32_t*)addr)); */
 
 	// map page to user
 	/* down_read(&current->mm->mmap_sem); */
