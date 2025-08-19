@@ -653,7 +653,6 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	else
 		gfp = GFP_KERNEL;
 
-	unsigned int order;
 	struct page *page = NULL;
 	struct page **pages = NULL;
 	void *addr;
@@ -679,7 +678,7 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	);
 	if (ret != nr_pages) {
 		pr_err("pin_user_pages: failed %d\n", ret);
-		goto free_pages;
+		goto free_tmp;
 	}
 	page = pages[0]; // TODO
 
@@ -719,7 +718,7 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	 * shrink so no re-encryption occurs in dma_direct_free().
 	 */
 	ret = set_memory_decrypted((unsigned long)page_to_virt(page),
-				   1 << order);
+				   nr_pages);
 	if (ret)
 		goto remove_mapping;
 	/* ret = gen_pool_add_virt(pool, (unsigned long)addr, page_to_phys(page), */
@@ -764,14 +763,14 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
   pte_t *pte;
   spinlock_t *ptl;
   ret = follow_pte(current->mm, user_addr, &pte, &ptl);
-  if (ret) {
-      pr_err("follow_pte failed: %d\n", ret);
-    	goto pte_unlock;
-  }
-  if (pte_none(*pte)) {
-      pr_err("PTE is empty at %lx\n", user_addr);
-    goto pte_unlock;
-  }
+  if (ret || pte_none(*pte)) {
+      pr_err("follow_pte failed for %lx: %d\n", user_addr, ret);
+			/* if (ptl != NULL) */
+  			/* pte_unmap_unlock(pte, ptl); // TODO */
+  	  ret = -EFAULT;
+    	goto encrypt_mapping;
+  } else {
+
   pr_info("Found user PTE: %lx, present=%d, pfn=%lx\n",
           pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
 pte_unlock:
@@ -797,6 +796,7 @@ pte_unlock:
 
 	debug_user_pte(user_addr);
 
+  }
 
 
 //	// Find the VMA containing this address
