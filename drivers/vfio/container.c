@@ -641,12 +641,13 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 {
 	if (pool_size != PAGE_SIZE) {
 		pr_err("VFIO CVM hack: We dont support decrypting vairable sized memory regions yet. Please do one page at a time.\n");
-		pr_err"VFIO CVM hack:   :o)\n");
+		pr_err("VFIO CVM hack:   :o)\n");
 		return -EINVAL;
 	}
 	pr_err("fizz1\n");
 	gfp_t gfp;
 	size_t nr_pages = 1; // TODO
+	size_t page_size = pool_size;
 	if (IS_ENABLED(CONFIG_ZONE_DMA))
 		gfp = GFP_KERNEL | GFP_DMA;
 	else
@@ -661,6 +662,12 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	pages = kmalloc(nr_pages*sizeof(void*), GFP_KERNEL);
 	if (pages == NULL)
 		return -ENOMEM;
+
+	void *tmp = kmalloc(page_size, GFP_KERNEL);
+	if (tmp == NULL) {
+		ret = -ENOMEM;
+		goto free_pages;
+	}
 
 	pr_err("pages %lx\n", pages);
 	ret = pin_user_pages_fast(
@@ -704,6 +711,9 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 //#endif
 	addr = page_to_virt(page);
 	debug_kernel_pte(addr);
+
+	memcpy(tmp, addr, page_size); // copy plaintext page to tmp scratch
+
 	/*
 	 * Memory in the atomic DMA pools must be unencrypted, the pools do not
 	 * shrink so no re-encryption occurs in dma_direct_free().
@@ -718,8 +728,11 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	/* 	goto encrypt_mapping; */
 	debug_kernel_pte(addr);
 
+	// page is now 0 again
+	memcpy(addr, tmp, page_size); // copy plaintext back to decrypted page
+
 	/* dma_atomic_pool_size_add(gfp, pool_size); */
-	pr_err("fizz heureka1 virt %p phys %lx, %lx\n", addr, page_to_pfn(page), (page_to_pfn(page))*PAGE_SIZE);
+	pr_err("fizz heureka1 user virt 0x%lx phys %lx, %lx\n", user_addr, page_to_pfn(page), (page_to_pfn(page))*PAGE_SIZE);
 	/* *((uint32_t*)addr) = 0x1337; */
 	/* pr_err("u32: %lx\n", *((uint32_t*)addr)); */
 
@@ -846,6 +859,8 @@ free_page:
 	/* __free_pages(page, order); */
 unpin_out:
 	unpin_user_pages(pages, nr_pages);
+free_tmp:
+	kfree(tmp);
 free_pages:
 	kfree(pages);
 out:
