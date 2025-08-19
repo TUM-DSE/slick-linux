@@ -567,6 +567,40 @@ static struct mm_struct *get_init_mm(void)
     return init_mm_ptr;
 }
 
+static void debug_kernel_pte(unsigned long addr)
+{
+    pte_t *pte;
+    spinlock_t *ptl;
+    int ret;
+
+    static struct mm_struct *init_mm_ptr = NULL;
+
+    if (!init_mm_ptr) {
+        /* init_mm_ptr = (struct mm_struct *)kallsyms_lookup_name("init_mm"); */
+				find_kallsyms_lookup_name();
+    		init_mm_ptr = get_init_mm();
+        if (!init_mm_ptr) {
+            printk(KERN_ERR "Could not find init_mm symbol\n");
+            return;
+        }
+    }
+
+    ret = follow_pte(init_mm_ptr, addr, &pte, &ptl);
+    if (ret) {
+        pr_err("follow_pte failed: %d\n", ret);
+        return;
+    }
+
+    if (pte_none(*pte)) {
+        pr_err("PTE is empty at %lx\n", addr);
+    } else {
+        pr_info("PTE exists: %lx, present=%d, pfn=%lx\n",
+                pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
+    }
+
+    pte_unmap_unlock(pte, ptl);
+}
+
 static void debug_user_pte(unsigned long addr)
 {
     pte_t *pte;
@@ -603,120 +637,9 @@ static void __cpa_flush_all(void *arg)
 		wbinvd();
 }
 
-
-// stolen from mm/memory.c
-/*
- * huge_pte_offset() - Walk the page table to resolve the hugepage
- * entry at address @addr
- *
- * Return: Pointer to page table entry (PUD or PMD) for
- * address @addr, or NULL if a !p*d_present() entry is encountered and the
- * size @sz doesn't match the hugepage size at this level of the page
- * table.
- */
-pte_t *huge_pte_offset(struct mm_struct *mm,
-		       unsigned long addr, unsigned long sz)
-{
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
-	pmd_t *pmd;
-
-	pgd = pgd_offset(mm, addr);
-	if (!pgd_present(*pgd))
-		return NULL;
-	p4d = p4d_offset(pgd, addr);
-	if (!p4d_present(*p4d))
-		return NULL;
-
-	pud = pud_offset(p4d, addr);
-	if (sz == PUD_SIZE)
-		/* must be pud huge, non-present or none */
-		return (pte_t *)pud;
-	if (!pud_present(*pud))
-		return NULL;
-	/* must have a valid entry and size to go further */
-
-	pmd = pmd_offset(pud, addr);
-	/* must be pmd huge, non-present or none */
-	return (pte_t *)pmd;
-}
-
-// look up 2M hugepage address
-int follow_pmd_large(struct mm_struct *mm, unsigned long address,
-	       pte_t **ptepp)
-{
-	pmd_t *pmdp;
-
-	pmdp = (pmd_t*) huge_pte_offset(mm, address, 2*1024*1024);
-
-	if (pmdp == NULL)
-		goto out;
-
-	if (!pmd_large(*pmdp))
-		goto out;
-
-	if (!pmd_present(*pmdp))
-		goto out;
-
-	if (!pmd_present(*pmdp))
-		goto out;
-
-	// TODO We should probably use the huge_pte_lock() here...
-
-	/* ptep = pte_offset_map_lock(mm, pmd, address, ptlp); */
-	/* if (!ptep) */
-	/* 	goto out; */
-	/* if (!pte_present(ptep_get(ptep))) */
-	/* 	goto unlock; */
-	*ptepp = (pte_t*)pmdp;
-	return 0;
-/* unlock: */
-/* 	pte_unmap_unlock(ptep, *ptlp); */
-out:
-	return -EINVAL;
-}
-
-static void debug_kernel_pte(unsigned long addr)
-{
-    pte_t *pte;
-    spinlock_t *ptl;
-    int ret;
-
-    static struct mm_struct *init_mm_ptr = NULL;
-
-    if (!init_mm_ptr) {
-        /* init_mm_ptr = (struct mm_struct *)kallsyms_lookup_name("init_mm"); */
-				find_kallsyms_lookup_name();
-    		init_mm_ptr = get_init_mm();
-        if (!init_mm_ptr) {
-            printk(KERN_ERR "Could not find init_mm symbol\n");
-            return;
-        }
-    }
-
-    /* ret = follow_pte(init_mm_ptr, addr, &pte, &ptl); */
-  	ret = follow_pmd_large(init_mm_ptr, addr, &pte);
-    if (ret) {
-        pr_err("follow_pte failed: %d\n", ret);
-        return;
-    }
-
-    if (pte_none(*pte)) {
-        pr_err("PTE is empty at %lx\n", addr);
-    } else {
-        pr_info("PTE exists: %lx, present=%d, pfn=%lx\n",
-                pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
-    }
-
-    /* pte_unmap_unlock(pte, ptl); */
-}
-
-
 static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 {
-	if (pool_size != PAGE_SIZE && pool_size != 2*1024*1024) {
-		// only allow a single (huge-)page
+	if (pool_size != PAGE_SIZE) {
 		pr_err("VFIO CVM hack: We dont support decrypting vairable sized memory regions yet. Please do one page at a time.\n");
 		pr_err("VFIO CVM hack:   :o)\n");
 		return -EINVAL;
@@ -839,8 +762,7 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	pr_info("flushed\n");
   pte_t *pte;
   spinlock_t *ptl;
-  /* ret = follow_pte(current->mm, user_addr, &pte, &ptl); */
-  ret = follow_pmd_large(current->mm, user_addr, &pte);
+  ret = follow_pte(current->mm, user_addr, &pte, &ptl);
   if (ret || pte_none(*pte)) {
       pr_err("follow_pte failed for %lx: %d\n", user_addr, ret);
 			/* if (ptl != NULL) */
@@ -851,9 +773,8 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 
   pr_info("Found user PTE: %lx, present=%d, pfn=%lx\n",
           pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
-
-	/* if (ptl != NULL) */
- /*  	pte_unmap_unlock(pte, ptl); // TODO */
+pte_unlock:
+  pte_unmap_unlock(pte, ptl); // TODO
 
 	debug_user_pte(user_addr);
 
@@ -874,10 +795,6 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
   asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
 
 	debug_user_pte(user_addr);
-  ret = follow_pmd_large(current->mm, user_addr, &pte);
-  pr_info("%d: Found user PTE: %lx, present=%d, pfn=%lx\n", ret,
-          pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
-  ret = 0;
 
   }
 
