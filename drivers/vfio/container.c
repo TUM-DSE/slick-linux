@@ -672,7 +672,7 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	ret = pin_user_pages_fast(
 		user_addr,
 		nr_pages,
-		0 // maybe FOLL_LONGTERM if we want to explicitly want to pin beyond the parent function invcation lifetime
+		FOLL_LONGTERM // maybe FOLL_LONGTERM if we want to explicitly want to pin beyond the parent function invcation lifetime
 		,
 		pages
 	);
