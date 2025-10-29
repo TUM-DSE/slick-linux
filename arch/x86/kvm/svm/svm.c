@@ -2455,6 +2455,12 @@ reinject:
 	return 1;
 }
 
+static int vc_interception(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_svm* svm = to_svm(vcpu);
+	return sev_vc_vmpl(svm);
+}
+
 void svm_set_gif(struct vcpu_svm *svm, bool value)
 {
 	if (value) {
@@ -3347,6 +3353,7 @@ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[SVM_EXIT_EXCP_BASE + MC_VECTOR]	= mc_interception,
 	[SVM_EXIT_EXCP_BASE + AC_VECTOR]	= ac_interception,
 	[SVM_EXIT_EXCP_BASE + GP_VECTOR]	= gp_interception,
+	[SVM_EXIT_EXCP_BASE + VC_VECTOR]    = vc_interception,
 	[SVM_EXIT_INTR]				= intr_interception,
 	[SVM_EXIT_NMI]				= nmi_interception,
 	[SVM_EXIT_SMI]				= smi_interception,

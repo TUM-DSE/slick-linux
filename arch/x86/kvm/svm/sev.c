@@ -4437,6 +4437,23 @@ static int __sev_run_vmpl_vmsa(struct vcpu_svm *svm, unsigned int new_vmpl)
 	return 0;
 }
 
+#define SVSM_VMPL_LEVEL 0
+int sev_vc_vmpl(struct vcpu_svm *svm)
+{
+	u32 vmpl = vmpl_vmsa(svm)->vmpl;
+	int ret;
+	if (vmpl == 0 || vmpl == 2)
+		return 1;
+
+	ret = __sev_run_vmpl_vmsa(svm, SVSM_VMPL_LEVEL);
+	if (ret) {
+		pr_alert("Failed to change VMPL level");
+		return ret;
+	}
+	return 1;
+}
+
+
 static int sev_snp_hv_doorbell_page(struct vcpu_svm *svm)
 {
 	struct kvm_vcpu *vcpu = &svm->vcpu;

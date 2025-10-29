@@ -174,6 +174,7 @@
 	{ SVM_EXIT_EXCP_BASE + AC_VECTOR,       "AC excp" }, \
 	{ SVM_EXIT_EXCP_BASE + MC_VECTOR,       "MC excp" }, \
 	{ SVM_EXIT_EXCP_BASE + XM_VECTOR,       "XF excp" }, \
+	{ SVM_EXIT_EXCP_BASE + VC_VECTOR,       "VC excp" }, \
 	{ SVM_EXIT_INTR,        "interrupt" }, \
 	{ SVM_EXIT_NMI,         "nmi" }, \
 	{ SVM_EXIT_SMI,         "smi" }, \
