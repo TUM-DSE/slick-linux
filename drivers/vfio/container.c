@@ -639,48 +639,38 @@ static void __cpa_flush_all(void *arg)
 
 static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 {
-	if (pool_size != PAGE_SIZE) {
-		pr_err("VFIO CVM hack: We dont support decrypting vairable sized memory regions yet. Please do one page at a time.\n");
-		pr_err("VFIO CVM hack:   :o)\n");
-		return -EINVAL;
-	}
-	pr_err("fizz1\n");
+	pr_info("hacky_atomic_pool_expand: user_addr=%lx size=%zu\n", user_addr, pool_size);
 	gfp_t gfp;
-	size_t nr_pages = 1; // TODO
-	size_t page_size = pool_size;
+	size_t nr_pages = pool_size >> PAGE_SHIFT;
+	unsigned int order = get_order(pool_size);
 	if (IS_ENABLED(CONFIG_ZONE_DMA))
 		gfp = GFP_KERNEL | GFP_DMA;
 	else
 		gfp = GFP_KERNEL;
 
-	struct page *page = NULL;
+	struct page *contig = NULL;
 	struct page **pages = NULL;
-	void *addr;
 	int ret = -ENOMEM;
+	int i;
 
-	pages = kmalloc(nr_pages*sizeof(void*), GFP_KERNEL);
-	if (pages == NULL)
+	/* Allocate physically contiguous pages from buddy allocator */
+	contig = alloc_pages(gfp, order);
+	if (!contig)
 		return -ENOMEM;
 
-	void *tmp = kmalloc(page_size, GFP_KERNEL);
-	if (tmp == NULL) {
-		ret = -ENOMEM;
-		goto free_pages;
-	}
+	pages = kmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+	if (pages == NULL)
+		goto free_contig;
 
-	pr_err("pages %lx\n", pages);
-	ret = pin_user_pages_fast(
-		user_addr,
-		nr_pages,
-		FOLL_LONGTERM // maybe FOLL_LONGTERM if we want to explicitly want to pin beyond the parent function invcation lifetime
-		,
-		pages
-	);
-	if (ret != nr_pages) {
-		pr_err("pin_user_pages: failed %d\n", ret);
-		goto free_tmp;
+	ret = pin_user_pages_fast(user_addr, nr_pages,
+		FOLL_WRITE | FOLL_LONGTERM, pages);
+	if (ret != (int)nr_pages) {
+		pr_err("pin_user_pages: wanted %zu got %d\n", nr_pages, ret);
+		if (ret > 0)
+			unpin_user_pages(pages, ret);
+		ret = -EFAULT;
+		goto free_arr;
 	}
-	page = pages[0]; // TODO
 
 //	/* Cannot allocate larger than MAX_ORDER */
 //	order = min(get_order(pool_size), MAX_ORDER);
@@ -708,30 +698,20 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 //#else
 //	addr = page_to_virt(page);
 //#endif
-	addr = page_to_virt(page);
-	debug_kernel_pte(addr);
-
-	memcpy(tmp, addr, page_size); // copy plaintext page to tmp scratch
-
-	/*
-	 * Memory in the atomic DMA pools must be unencrypted, the pools do not
-	 * shrink so no re-encryption occurs in dma_direct_free().
-	 */
-	ret = set_memory_decrypted((unsigned long)page_to_virt(page),
+	/* Decrypt the contiguous block */
+	ret = set_memory_decrypted((unsigned long)page_to_virt(contig),
 				   nr_pages);
 	if (ret)
-		goto remove_mapping;
-	/* ret = gen_pool_add_virt(pool, (unsigned long)addr, page_to_phys(page), */
-	/* 			pool_size, NUMA_NO_NODE); */
-	/* if (ret) */
-	/* 	goto encrypt_mapping; */
-	debug_kernel_pte(addr);
+		goto unpin;
 
-	// page is now 0 again
-	memcpy(addr, tmp, page_size); // copy plaintext back to decrypted page
+	/* Copy plaintext from old encrypted pages to new decrypted pages.
+	 * Old: kernel direct map C-bit set -> CPU decrypts on read.
+	 * New: kernel direct map C-bit cleared -> CPU writes plaintext. */
+	for (i = 0; i < (int)nr_pages; i++)
+		memcpy(page_to_virt(contig + i), page_to_virt(pages[i]), PAGE_SIZE);
 
-	/* dma_atomic_pool_size_add(gfp, pool_size); */
-	pr_err("fizz heureka1 user virt 0x%lx phys %lx, %lx\n", user_addr, page_to_pfn(page), (page_to_pfn(page))*PAGE_SIZE);
+	pr_info("hacky: user %lx, contig phys %lx, %zu pages\n",
+		user_addr, page_to_pfn(contig) * PAGE_SIZE, nr_pages);
 	/* *((uint32_t*)addr) = 0x1337; */
 	/* pr_err("u32: %lx\n", *((uint32_t*)addr)); */
 
@@ -757,46 +737,33 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	/* pr_err("prot enc %lx\n", foo.pgprot); */
 
 
-	pr_info("flushing\n");
 	on_each_cpu(__cpa_flush_all, (void *) true, 1);
-	pr_info("flushed\n");
+
+	/* Update user PTEs: point to new contiguous pages, clear C-bit */
   pte_t *pte;
   spinlock_t *ptl;
-  ret = follow_pte(current->mm, user_addr, &pte, &ptl);
-  if (ret || pte_none(*pte)) {
-      pr_err("follow_pte failed for %lx: %d\n", user_addr, ret);
-			/* if (ptl != NULL) */
-  			/* pte_unmap_unlock(pte, ptl); // TODO */
-  	  ret = -EFAULT;
-    	goto encrypt_mapping;
-  } else {
+	for (i = 0; i < (int)nr_pages; i++) {
+		unsigned long uaddr = user_addr + i * PAGE_SIZE;
+		ret = follow_pte(current->mm, uaddr, &pte, &ptl);
+		if (ret) {
+			pr_err("follow_pte failed for %lx: %d\n", uaddr, ret);
+			goto unpin;
+		}
+		/* NOTE: lock released before use — holding it across
+		 * on_each_cpu causes IPI deadlock on SNP */
+		pte_unmap_unlock(pte, ptl);
 
-  pr_info("Found user PTE: %lx, present=%d, pfn=%lx\n",
-          pte_val(*pte), pte_present(*pte), pte_pfn(*pte));
-pte_unlock:
-  pte_unmap_unlock(pte, ptl); // TODO
+		pte_t old_pte = *pte;
+		pgprot_t new_prot = pgprot_decrypted(pte_pgprot(old_pte));
+		pte_t new_pte = pfn_pte(page_to_pfn(contig + i), new_prot);
+		pr_info("page %d: user pte %lx -> %lx (pfn %lx -> %lx)\n",
+			i, old_pte.pte, new_pte.pte,
+			pte_pfn(old_pte), page_to_pfn(contig + i));
+		set_pte_atomic(pte, new_pte);
+		asm volatile("invlpg (%0)" ::"r" (uaddr) : "memory");
+	}
 
-	debug_user_pte(user_addr);
-
-	pte_t old_pte = *pte;
-	pgprot_t new_prot = pte_pgprot(old_pte);
-	new_prot = pgprot_decrypted(new_prot);
-	pte_t new_pte = pfn_pte(pte_pfn(old_pte), new_prot);
-	pr_err("user pte %lx -> %lx\n", old_pte.pte, new_pte.pte);
-	asm volatile("" ::: "memory");
-	/* on_each_cpu(__cpa_flush_all, (void *) !!pgprot2cachemode(new_prot), 1); */
 	on_each_cpu(__cpa_flush_all, (void *) true, 1);
-	set_pte_atomic(pte, new_pte); // i doubt that our mess around here is atomic
-	on_each_cpu(__cpa_flush_all, (void *) true, 1);
-
-	// TODO Do hugepages have several PTEs per page? See __change_page_attr:repeat
-
-	// TODO We need some TLB flush at least no? see change_page_attr_set_clr() cpa_flush_all(!!pgprot2cachemode(new_prot));
-  asm volatile("invlpg (%0)" ::"r" (user_addr) : "memory");
-
-	debug_user_pte(user_addr);
-
-  }
 
 
 //	// Find the VMA containing this address
@@ -844,26 +811,12 @@ pte_unlock:
 
 	return 0;
 
-encrypt_mapping:
-	//ret = set_memory_encrypted((unsigned long)page_to_virt(page),
-	//			   1 << order);
-	//if (WARN_ON_ONCE(ret)) {
-	//	/* Decrypt succeeded but encrypt failed, purposely leak */
-	//	goto out;
-	//}
-remove_mapping:
-//#ifdef CONFIG_DMA_DIRECT_REMAP
-//	dma_common_free_remap(addr, pool_size);
-//#endif
-free_page:
-	/* __free_pages(page, order); */
-unpin_out:
+unpin:
 	unpin_user_pages(pages, nr_pages);
-free_tmp:
-	kfree(tmp);
-free_pages:
+free_arr:
 	kfree(pages);
-out:
+free_contig:
+	__free_pages(contig, order);
 	return ret;
 }
 
