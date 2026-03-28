@@ -639,31 +639,29 @@ static void __cpa_flush_all(void *arg)
 
 static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 {
-	pr_info("hacky_atomic_pool_expand: user_addr=%lx size=%zu\n", user_addr, pool_size);
-	gfp_t gfp;
+	/* pr_info("hacky_atomic_pool_expand: user_addr=%lx size=%zu\n", user_addr, pool_size); */
 	size_t nr_pages = pool_size >> PAGE_SHIFT;
 	unsigned int order = get_order(pool_size);
-	if (IS_ENABLED(CONFIG_ZONE_DMA))
-		gfp = GFP_KERNEL | GFP_DMA;
-	else
-		gfp = GFP_KERNEL;
 
 	struct page *contig = NULL;
 	struct page **pages = NULL;
 	int ret = -ENOMEM;
 	int i;
 
-	/* Allocate physically contiguous pages from buddy allocator */
-	contig = alloc_pages(gfp, order);
-	if (!contig)
+	/* Allocate physically contiguous pages; CMA for multi-page; since we are hopefully the only one using CMA actively, even separate allocs are likely contiguous */
+	contig = dma_alloc_from_contiguous(NULL, nr_pages, order, false);
+	if (!contig) {
+		pr_err("failed to allocate contig pages (nr=%zu order=%u)\n",
+		       nr_pages, order);
 		return -ENOMEM;
+	}
 
 	pages = kmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
 	if (pages == NULL)
 		goto free_contig;
 
 	ret = pin_user_pages_fast(user_addr, nr_pages,
-		FOLL_WRITE | FOLL_LONGTERM, pages);
+		FOLL_WRITE, pages); // can't use FOLL_LONGTERM here because it would trigger deadlocks right now. I hope our CMA pages wont be moved anyways.
 	if (ret != (int)nr_pages) {
 		pr_err("pin_user_pages: wanted %zu got %d\n", nr_pages, ret);
 		if (ret > 0)
@@ -710,8 +708,8 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 	for (i = 0; i < (int)nr_pages; i++)
 		memcpy(page_to_virt(contig + i), page_to_virt(pages[i]), PAGE_SIZE);
 
-	pr_info("hacky: user %lx, contig phys %lx, %zu pages\n",
-		user_addr, page_to_pfn(contig) * PAGE_SIZE, nr_pages);
+	/* pr_info("hacky: user %lx, contig phys %lx, %zu pages\n", */
+	/* 	user_addr, page_to_pfn(contig) * PAGE_SIZE, nr_pages); */
 	/* *((uint32_t*)addr) = 0x1337; */
 	/* pr_err("u32: %lx\n", *((uint32_t*)addr)); */
 
@@ -756,7 +754,7 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 		pte_t old_pte = *pte;
 		pgprot_t new_prot = pgprot_decrypted(pte_pgprot(old_pte));
 		pte_t new_pte = pfn_pte(page_to_pfn(contig + i), new_prot);
-		pr_info("page %d: user pte %lx -> %lx (pfn %lx -> %lx)\n",
+		pr_err("hacky_atomic_pool_expand: page %d: user pte %lx -> %lx (pfn %lx -> %lx)\n",
 			i, old_pte.pte, new_pte.pte,
 			pte_pfn(old_pte), page_to_pfn(contig + i));
 		set_pte_atomic(pte, new_pte);
@@ -765,6 +763,9 @@ static int hacky_atomic_pool_expand(unsigned long user_addr, size_t pool_size)
 
 	on_each_cpu(__cpa_flush_all, (void *) true, 1);
 
+	/* Unpin the old pages — PTEs now point to the contig replacements */
+	unpin_user_pages(pages, nr_pages);
+	kfree(pages);
 
 //	// Find the VMA containing this address
 //  struct vm_area_struct *vma = find_vma(current->mm, user_addr);
@@ -816,14 +817,16 @@ unpin:
 free_arr:
 	kfree(pages);
 free_contig:
-	__free_pages(contig, order);
+	dma_release_from_contiguous(NULL, contig, nr_pages);
+	if (ret)
+		pr_err("Failed to hackily change c-bit: %d\n", ret);
 	return ret;
 }
 
 static int vfio_cvm_map_dma(struct vfio_iommu *iommu,
 				    unsigned long arg)
 {
-	pr_err("foobar5\n");
+	/* pr_err("vfio_cvm_map_dma()\n"); */
 	struct vfio_iommu_type1_dma_map map;
 	unsigned long minsz;
 	uint32_t mask = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE |
@@ -831,7 +834,7 @@ static int vfio_cvm_map_dma(struct vfio_iommu *iommu,
 
 	minsz = offsetofend(struct vfio_iommu_type1_dma_map, size);
 
-	pr_err("foobar6\n");
+	/* pr_err("foobar6\n"); */
 	if (copy_from_user(&map, (void __user *)arg, minsz))
 		return -EFAULT;
 
@@ -877,7 +880,7 @@ static void vfio_noiommu_release(void *iommu_data)
 static long vfio_noiommu_ioctl(void *iommu_data,
 			       unsigned int cmd, unsigned long arg)
 {
-	pr_err("foobar\n");
+	/* pr_err("foobar\n"); */
 	/* struct vfio_iommu *iommu = iommu_data; // TODO never lol */
 
 	switch (cmd) {
@@ -1170,7 +1173,7 @@ static long vfio_ioctl_set_iommu(struct vfio_container *container,
 static long vfio_fops_unl_ioctl(struct file *filep,
 				unsigned int cmd, unsigned long arg)
 {
-	pr_err("foobar3\n");
+	/* pr_err("foobar3\n"); */
 	struct vfio_container *container = filep->private_data;
 	struct vfio_iommu_driver *driver;
 	void *data;
